@@ -1,21 +1,20 @@
-
-{-# LANGUAGE   LambdaCase
-             , ScopedTypeVariables
+{-# LANGUAGE   FlexibleContexts
+             , LambdaCase
              , OverloadedStrings
-             , RecordWildCards #-}
+             , RecordWildCards
+             , ScopedTypeVariables #-}
 
-module Main (main) where
+module HackageDiff where
 
 import System.Exit
 import System.Directory
-import System.Environment
 import System.FilePath
 import System.Process
-import System.Console.GetOpt
 import System.Console.ANSI
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State
+import Control.Monad.Trans.Except
 import Control.Applicative
 import Control.Exception
 import Control.Concurrent.Async
@@ -37,97 +36,63 @@ import Language.Haskell.Exts as E
 import Language.Preprocessor.Cpphs
 import Network.HTTP
 
-main :: IO ()
-main = do
-    -- Process command line arguments
-    (pkgName, argVerA, argVerB, flags) <-
-        runExcept <$> (getCmdOpt <$> getProgName <*> getArgs) >>= either die return
+
+data PackageToDiff = PackageToDiff
+    { ptdPackageName :: String
+    , ptdVersionA    :: String
+    , ptdVersionB    :: String
+    }
+
+data DiffConfig = DiffConfig
+    { diffConfigMode         :: FlagMode
+    , diffConfigSilentFlag   :: Bool
+    }
+
+packageDiff :: DiffConfig -> PackageToDiff -> IO (Either String Diff)
+packageDiff cfg (PackageToDiff pkgName argVerA argVerB) = runExceptT $ do
     when (argVerA == argVerB) $
-        die "Need to specify different versions / packages for comparison"
-    mode <- case foldr (\f r -> case f of FlagMode m -> m; _ -> r) "downloaddb" flags of
-                "downloaddb" -> return ModeDownloadDB
-                "builddb"    -> return ModeBuildDB
-                "parsehs"    -> return ModeParseHS
-                m            -> die $ printf "'%s' is not a valid mode" m
-    let disableColor = FlagDisableColor `elem` flags
-        silentFlag   = FlagSilent       `elem` flags
+        throwE "Need to specify different versions / packages for comparison"
+    let silentFlag   = diffConfigSilentFlag cfg
+        mode         = diffConfigMode cfg
     -- Did we get a package version, DB path or package path?
     ([verA, verB] :: [EitherVerPath]) <- forM [argVerA, argVerB] $ \ver ->
         case parseOnly pkgVerParser (T.pack ver) of
             -- Not a version, check if we got a valid DB file or package path
             Left  _ | mode == ModeParseHS -> do
-                        flip unless (die $ errHdr ++ " or package path" ) =<< doesDirectoryExist ver
+                        exists <- liftIO $ doesDirectoryExist ver
+                        unless exists (throwE $ errHdr ++ " or package path" )
                         return $ Right ver
                     | otherwise           -> do
-                        flip unless (die $ errHdr ++ " or database path") =<< doesFileExist      ver
+                        exists <- liftIO $ doesFileExist ver
+                        unless exists (throwE $ errHdr ++ " or database path")
                         return $ Right ver
                   where errHdr = "'" ++ ver ++ "' is not a valid version string (1.0[.0[.0]])"
             -- Looks like a valid version string
             Right _ -> return $ Left ver
-    diff <- withTmpDirectory $ \tmpDir -> do
+    diff <- ExceptT $ withTmpDirectory $ \tmpDir -> do
         -- Need to download packages?
         when (mode `elem` [ModeBuildDB, ModeParseHS]) $
             forM_ (lefts [verA, verB]) $ \verString -> do
                 let pkg = pkgName ++ "-" ++ verString
                 unless silentFlag . putStrLn $ "Downloading " ++ pkg ++ "..."
-                runExceptT (downloadPackage pkg tmpDir) >>= either die return
+                runExceptT (downloadPackage pkg tmpDir)
         -- Parse, compute difference
-        either die return =<<
-            ( runExceptT $
-                  let cp = ComputeParams tmpDir pkgName verA verB silentFlag
-                   in case mode of
-                          ModeDownloadDB -> computeDiffDownloadHoogleDB cp
-                          ModeBuildDB    -> computeDiffBuildHoogleDB    cp
-                          ModeParseHS    -> computeDiffParseHaskell     cp
-            )
+        runExceptT $
+            let cp = ComputeParams tmpDir pkgName verA verB silentFlag
+             in case mode of
+                    ModeDownloadDB -> computeDiffDownloadHoogleDB cp
+                    ModeBuildDB    -> computeDiffBuildHoogleDB    cp
+                    ModeParseHS    -> computeDiffParseHaskell     cp
+
     -- Output results
-    unless silentFlag $ printf "\n--- Diff for | %s → %s | ---\n\n"
-                               (either id id verA)
-                               (either id id verB)
-    outputDiff diff disableColor silentFlag
+    unless silentFlag $ throwE $
+      printf "\n--- Diff for | %s → %s | ---\n\n"
+             (either id id verA)
+             (either id id verB)
+    return diff
 
 data FlagMode = ModeDownloadDB | ModeBuildDB | ModeParseHS
                 deriving (Eq)
-
-data CmdFlag = FlagDisableColor | FlagSilent | FlagMode String
-               deriving (Eq)
-
-getCmdOpt :: String -> [String] -> Except String (String, String, String, [CmdFlag])
-getCmdOpt prgName args =
-    case getOpt RequireOrder opt args of
-        (flags, (pkgName:verA:verB:[]), []) -> return (pkgName, verA, verB, flags)
-        (_, _, [])                          -> throwError usage
-        (_, _, err)                         -> throwError (concat err ++ "\n" ++ usage)
-  where
-    header =
-      "hackage-diff | Compare the public API of different versions of a Hackage library\n" ++
-      "github.com/blitzcode/hackage-diff | www.blitzcode.net | (C) 2016 Tim C. Schroeder\n\n" ++
-      "Usage: " ++ prgName ++ " [options] <package-name> <old-version|path> <new-version|path>"
-    footer =
-      "\nExamples:\n" ++
-      "  " ++ prgName ++ " mtl 2.1 2.2.1\n" ++
-      "  " ++ prgName ++ " --mode=builddb JuicyPixels 3.1.4.1 3.1.5.2\n" ++
-      "  " ++ prgName ++ " conduit 1.1.5 ~/tmp/conduit-1.1.6/dist/doc/html/conduit/conduit.txt\n" ++
-      "  " ++ prgName ++ " --mode=parsehs QuickCheck 2.6 2.7.6\n" ++
-      "  " ++ prgName ++ " --mode=parsehs -s Cabal ~/tmp/Cabal-1.18.0/ 1.20.0.0\n"
-    usage  = usageInfo header opt ++ footer
-    opt    = [ Option []
-                      ["mode"]
-                      (ReqArg FlagMode "[downloaddb|builddb|parsehs]")
-                      ( "what to download / read, how to compare\n" ++
-                        "  downloaddb - download Hoogle DBs and diff (Default)\n" ++
-                        "  builddb    - download packages, build Hoogle DBs and diff\n" ++
-                        "  parsehs    - download packages, directly diff .hs exports"
-                      )
-             , Option ['c']
-                      ["disable-color"]
-                      (NoArg FlagDisableColor)
-                      "disable color output"
-             , Option ['s']
-                      ["silent"]
-                      (NoArg FlagSilent)
-                      "disable progress output"
-             ]
 
 -- Check a package version string (1.0[.0[.0]])
 pkgVerParser :: Parser ()
@@ -560,7 +525,7 @@ computeDiffParseHaskell ComputeParams { .. } = do
        -- Parse modules
        liftIO . forM modules $ \(modName, modPath) -> do
            unless cpSilentFlag . putStrLn $ "  Parsing " ++ modName
-           Main.parseModule modPath >>= either
+           parseModuleFile modPath >>= either
                -- Errors only affecting single modules are recoverable, just
                -- print them instead of throwing
                (\e -> putStrLn ("    " ++ e) >> return (modName, Nothing))
@@ -569,8 +534,8 @@ computeDiffParseHaskell ComputeParams { .. } = do
     return $ comparePackageModules mListA mListB
 
 -- Parse a Haskell module interface using haskell-src-exts and cpphs
-parseModule :: FilePath -> IO (Either String Module)
-parseModule modPath = runExceptT $ do
+parseModuleFile :: FilePath -> IO (Either String Module)
+parseModuleFile modPath = runExceptT $ do
     (liftIO $ doesFileExist modPath) >>= flip unless
         (throwError $ "Can't open source file '" ++ modPath ++ "'")
     -- Run cpphs as pre-processor over our module
@@ -637,4 +602,5 @@ comparePackageModules verA verB = do
         moduleExports _                                      = []
         findModule mlist mname = maybe Nothing snd $ find ((== mname) . fst) mlist
      in resAdded ++ resRemoved ++ resKept
+
 
